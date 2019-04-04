@@ -349,7 +349,8 @@ class CameraAcquisitionTask(HardwareSource.AcquisitionTask):
         data_element["properties"]["valid_rows"] = cumulative_data.shape[0]
         data_element["properties"]["frame_index"] = data_element["properties"]["frame_number"]
         data_element["properties"]["integration_count"] = cumulative_frame_count
-        if self.__camera_category in ("eels", "ronchigram"):
+# add support for Electron Induced Radiation Spectroscopy
+        if self.__camera_category in ("eels", "ronchigram", "eire"):
             data_element["properties"]["signal_type"] = self.__camera_category
         return [data_element]
 
@@ -502,6 +503,8 @@ class CameraHardwareSource(HardwareSource.HardwareSource):
         self.__event_loop = asyncio.new_event_loop()  # outputs a debugger message!
         logger.setLevel(old_level)
 
+        self.__acquisition_task = None
+
         self.__camera_settings = camera_settings
         self.__camera_settings.initialize(configuration_location=configuration_location, event_loop=self.__event_loop)
 
@@ -547,6 +550,10 @@ class CameraHardwareSource(HardwareSource.HardwareSource):
             self.features["is_ronchigram_camera"] = True
         if self.__camera_category.lower() == "eels":
             self.features["is_eels_camera"] = True
+            # self.processor = HardwareSource.SumProcessor(((0.25, 0.0), (0.5, 1.0)))
+        # add support for Electron Induced Radiation Spectroscopy
+        if self.__camera_category.lower() == "eire":
+            self.features["is_eire_camera"] = True
             self.processor = HardwareSource.SumProcessor(((0.25, 0.0), (0.5, 1.0)))
 
         # add channels
@@ -566,8 +573,6 @@ class CameraHardwareSource(HardwareSource.HardwareSource):
 
         self.__frame_parameters = CameraFrameParameters(self.__camera_settings.get_current_frame_parameters().as_dict())
         self.__record_parameters = CameraFrameParameters(self.__camera_settings.get_record_frame_parameters().as_dict())
-
-        self.__acquisition_task = None
 
         # the periodic logger function retrieves any log messages from the camera. it is called during
         # __handle_log_messages_event. any messages are sent out on the log_messages_event.
@@ -617,14 +622,12 @@ class CameraHardwareSource(HardwareSource.HardwareSource):
         self.__handle_log_messages_event()
 
     def __get_stem_controller(self):
-        if not self.__stem_controller and self.__stem_controller_id:
-            self.__stem_controller = HardwareSource.HardwareSourceManager().get_instrument_by_id(self.__stem_controller_id)
-        if not self.__stem_controller and not self.__stem_controller_id:
-            self.__stem_controller = Registry.get_component("stem_controller")
         if not self.__stem_controller:
-            print("STEM Controller (" + self.__stem_controller_id + ") for (" + self.hardware_source_id + ") not found. Using proxy.")
-            from nion.instrumentation import stem_controller
-            self.__stem_controller = self.__stem_controller or stem_controller.STEMController()
+            self.__stem_controller = HardwareSource.HardwareSourceManager().get_instrument_by_id(self.__stem_controller_id)
+            if not self.__stem_controller:
+                print("STEM Controller (" + self.__stem_controller_id + ") for (" + self.hardware_source_id + ") not found. Using proxy.")
+                from nion.instrumentation import stem_controller
+                self.__stem_controller = self.__stem_controller or stem_controller.STEMController()
         return self.__stem_controller
 
     def __handle_log_messages_event(self):
@@ -791,7 +794,7 @@ class CameraHardwareSource(HardwareSource.HardwareSource):
 
     def __current_frame_parameters_changed(self, frame_parameters):
         frame_parameters = CameraFrameParameters(frame_parameters.as_dict())
-        if self.__acquisition_task:
+        if self.__acquisition_task is not None:
             self.__acquisition_task.set_frame_parameters(frame_parameters)
         self.__frame_parameters = CameraFrameParameters(frame_parameters)
 
@@ -825,7 +828,7 @@ class CameraHardwareSource(HardwareSource.HardwareSource):
             defocus_value = stem_controller.get_value("C10")  # get the defocus
             dx = radians_per_pixel * defocus_value * (mouse_position[1] - (camera_shape[1] / 2))
             dy = radians_per_pixel * defocus_value * (mouse_position[0] - (camera_shape[0] / 2))
-            logging.info("Shifting (%s,%s) um.\n", -dx * 1e6, -dy * 1e6)
+            logging.info("Shifting (%s,%s) um.\n", dx * 1e6, dy * 1e6)
             stem_controller.set_value("SShft.x", stem_controller.get_value("SShft.x") - dx)
             stem_controller.set_value("SShft.y", stem_controller.get_value("SShft.y") - dy)
 
@@ -835,7 +838,7 @@ class CameraHardwareSource(HardwareSource.HardwareSource):
             radians_per_pixel = stem_controller.get_value("TVPixelAngle")
             da = radians_per_pixel * (mouse_position[1] - (camera_shape[1] / 2))
             db = radians_per_pixel * (mouse_position[0] - (camera_shape[0] / 2))
-            logging.info("Tilting (%s,%s) rad.\n", -da, -db)
+            logging.info("Tilting (%s,%s) rad.\n", da, db)
             stem_controller.set_value("STilt.x", stem_controller.get_value("STilt.x") - da)
             stem_controller.set_value("STilt.y", stem_controller.get_value("STilt.y") - db)
 
@@ -918,12 +921,13 @@ class CameraFrameParameters(dict):
         return deepcopy
 
     def as_dict(self):
-        return {
-            "exposure_ms": self.exposure_ms,
-            "binning": self.binning,
-            "processing": self.processing,
-            "integration_count": self.integration_count,
-        }
+        return self.__dict__
+        # return {
+        #     "exposure_ms": self.exposure_ms,
+        #     "binning": self.binning,
+        #     "processing": self.processing,
+        #     "integration_count": self.integration_count,
+        # }
 
 
 def get_stem_control(stem_controller, calibration_controls, key):
@@ -954,17 +958,25 @@ def update_spatial_calibrations(data_element, stem_controller, camera, camera_ca
             calibration_controls = camera.calibration_controls
             x_calibration_dict = build_calibration_dict(stem_controller, calibration_controls, "x", scaling_x)
             y_calibration_dict = build_calibration_dict(stem_controller, calibration_controls, "y", scaling_y)
-            if camera_category.lower() != "eels" and len(data_shape) == 2:
+            if camera_category.lower() != "eels" and camera_category.lower() != "eire" and len(data_shape) == 2:
                 y_calibration_dict["offset"] = -y_calibration_dict.get("scale", 1) * data_shape[0] * 0.5
                 x_calibration_dict["offset"] = -x_calibration_dict.get("scale", 1) * data_shape[1] * 0.5
                 data_element["spatial_calibrations"] = [y_calibration_dict, x_calibration_dict]
             else:
                 # cover the possibility that EELS data is returned as 1D
-                if len(data_shape) == 2:
-                    data_element["spatial_calibrations"] = [y_calibration_dict, x_calibration_dict]
-                else:
-                    data_element["spatial_calibrations"] = [x_calibration_dict]
-
+                if "properties" in data_element:
+                    if (data_element["properties"]["acquisition_mode"] == "Focus") or (data_element["properties"]["acquisition_mode"] == "Cumul"):
+                        if len(data_shape) == 2:
+                            data_element["spatial_calibrations"] = [y_calibration_dict, x_calibration_dict]
+                        else:
+                            data_element["spatial_calibrations"] = [x_calibration_dict]
+                    else:
+                        scale = camera.readoutTime
+                        time_scale_dict = Calibration.Calibration(0, scale, "s").rpc_dict
+                        if (data_element["properties"]["acquisition_mode"] == "1D-Chrono") or (data_element["properties"]["acquisition_mode"] == "1D-Chrono-Live"):
+                                data_element["spatial_calibrations"] = [time_scale_dict, x_calibration_dict]
+                        else:
+                            data_element["spatial_calibrations"] = [time_scale_dict, y_calibration_dict, x_calibration_dict]
 
 def update_intensity_calibration(data_element, stem_controller, camera):
     if "intensity_calibration" not in data_element:
@@ -1005,7 +1017,7 @@ def run(configuration_location: pathlib.Path):
     def component_registered(component, component_types):
         if "camera_module" in component_types:
             camera_module = component
-            stem_controller_id = getattr(camera_module, "stem_controller_id", None)
+            stem_controller_id = getattr(camera_module, "stem_controller_id", "autostem_controller")
             camera_settings = camera_module.camera_settings
             camera_device = camera_module.camera_device
             camera_panel_type = getattr(camera_module, "camera_panel_type", None)

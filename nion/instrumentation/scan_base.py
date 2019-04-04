@@ -24,7 +24,7 @@ from nion.utils import Event
 from nion.utils import Geometry
 from nion.utils import Model
 from nion.utils import Registry
-
+import inspect
 
 _ = gettext.gettext
 
@@ -76,6 +76,8 @@ class ScanFrameParameters(dict):
             d["subscan_fractional_size"] = self.subscan_fractional_size
         if self.subscan_fractional_center is not None:
             d["subscan_fractional_center"] = self.subscan_fractional_center
+        if self.channels is not None:
+            d["channels"] = self.channels
         return d
 
     def __repr__(self):
@@ -242,7 +244,10 @@ class ScanAcquisitionTask(HardwareSource.AcquisitionTask):
         def get_autostem_properties():
             autostem_properties = None
             try:
-                autostem_properties = self.__stem_controller.get_autostem_properties()
+                # avoid lot of messages in debug mode if function does not exist
+                if hasattr(self.__stem_controller, "get_autostem_properties"):
+                    if self.__stem_controller.get_autostem_properties is not None:
+                        autostem_properties = self.__stem_controller.get_autostem_properties()
             except Exception as e:
                 logging.info("autostem.get_autostem_properties has failed")
             return autostem_properties
@@ -269,6 +274,9 @@ class ScanAcquisitionTask(HardwareSource.AcquisitionTask):
             channel_index = int(_data_element["properties"]["channel_id"])
             _data = _data_element["data"]
             _properties = _data_element["properties"]
+            # Add the capability to have separate sub_area when all element do not have the same number of dimensions  Marcel
+            if "sub_area" in _data_element["properties"].keys():
+                sub_area = _data_element["properties"]["sub_area"]
             # create the 'data_element' in the format that must be returned from this method
             # '_data_element' is the format returned from the Device.
             data_element = dict()
@@ -508,7 +516,10 @@ class ScanHardwareSource(HardwareSource.HardwareSource):
                     scan_frame_parameters["size"] = scan_param_height, scan_param_width
                 # TODO: let the scan device adjust these parameters for synchronized acquisition instead of hardcoded values here
                 # pixel time should be limited to the max allowed by the scan device
-                scan_frame_parameters["pixel_time_us"] = min(5120000, int(1000 * camera_frame_parameters["exposure_ms"] * 0.75))
+                if "exposure" in camera_frame_parameters:
+                    scan_frame_parameters["pixel_time_us"] = min(5120000, int(1000000 * camera_frame_parameters["exposure"] * 0.75))
+                else:
+                    scan_frame_parameters["pixel_time_us"] = min(5120000, int(1000 * camera_frame_parameters["exposure_ms"] * 0.75))
                 # long timeout is needed until memory allocation is outside of the acquire_sequence call.
                 scan_frame_parameters["external_clock_wait_time_ms"] = 20000 # int(camera_frame_parameters["exposure_ms"] * 1.5)
                 scan_frame_parameters["external_clock_mode"] = 1
@@ -718,6 +729,10 @@ class ScanHardwareSource(HardwareSource.HardwareSource):
         changed = self.__device.set_channel_enabled(channel_index, enabled)
         if changed:
             self.__channel_states_changed([self.get_channel_state(i_channel_index) for i_channel_index in range(self.channel_count)])
+            "Marcel" \
+            "Add channels to profile."
+            if self.__frame_parameters.channels is not None:
+                self.__frame_parameters.channels = self.__device.channels_enabled
 
     def get_subscan_channel_info(self, channel_index: int, channel_id: str, channel_name: str) -> typing.Tuple[int, str, str]:
         return channel_index + self.channel_count, channel_id + "_subscan", " ".join((channel_name, _("SubScan")))
@@ -955,11 +970,16 @@ class ScanHardwareSource(HardwareSource.HardwareSource):
     def set_property(self, name, value):
         setattr(self, name, value)
 
-    def open_configuration_interface(self, api_broker):
+# Marcel: my solution to get the config dialog working
+    def open_configuration_interface(self, api_broker, document_controller):
         if hasattr(self.__device, "open_configuration_interface"):
             self.__device.open_configuration_interface()
         if hasattr(self.__device, "show_configuration_dialog"):
-            self.__device.show_configuration_dialog(api_broker)
+            args = inspect.signature(self.__device.show_configuration_dialog)
+            if len(args.parameters) == 2:
+                self.__device.show_configuration_dialog(api_broker, document_controller)
+            else:
+                self.__device.show_configuration_dialog(api_broker)
 
     def shift_click(self, mouse_position, camera_shape):
         frame_parameters = self.__device.current_frame_parameters
@@ -969,7 +989,7 @@ class ScanHardwareSource(HardwareSource.HardwareSource):
         # calculate dx, dy in meters
         dx = 1e-9 * pixel_size_nm * (mouse_position[1] - (camera_shape[1] / 2))
         dy = 1e-9 * pixel_size_nm * (mouse_position[0] - (camera_shape[0] / 2))
-        logging.info("Shifting (%s,%s) um.\n", -dx * 1e6, -dy * 1e6)
+        logging.info("Shifting (%s,%s) um.\n", dx * 1e6, dy * 1e6)
         self.__stem_controller.change_stage_position(dy=dy, dx=dx)
 
     def increase_pmt(self, channel_index):
